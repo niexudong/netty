@@ -36,6 +36,7 @@ import java.nio.channels.NotYetConnectedException;
 import java.util.NoSuchElementException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import static java.util.Objects.requireNonNull;
 
@@ -71,6 +72,10 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
     /** true if the channel has never been registered, false otherwise */
     private boolean neverRegistered = true;
 
+    private static final AtomicIntegerFieldUpdater<AbstractChannel> WRITABLE_UPDATER =
+            AtomicIntegerFieldUpdater.newUpdater(AbstractChannel.class, "writable");
+    private volatile int writable = 1;
+
     /**
      * Creates a new instance.
      *
@@ -91,8 +96,8 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         this.parent = parent;
         this.eventLoop = validateEventLoop(eventLoop);
         closePromise = new ClosePromise(eventLoop);
+        outboundBuffer = new ChannelOutboundBuffer(eventLoop);
         this.id = id;
-        outboundBuffer = new ChannelOutboundBuffer(this);
         pipeline = newChannelPipeline();
     }
 
@@ -199,24 +204,33 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
     @Override
     public final boolean isWritable() {
-        ChannelOutboundBuffer buf = outboundBuffer();
-        return buf != null && buf.isWritable();
+        return WRITABLE_UPDATER.get(this) == 1;
     }
 
+    private long totalPending() {
+        ChannelOutboundBuffer buf = outboundBuffer();
+        if (buf == null) {
+            return -1;
+        }
+        return buf.totalPendingWriteBytes() + pipeline().pendingOutboundBytes();
+    }
     @Override
     public final long bytesBeforeUnwritable() {
-        ChannelOutboundBuffer buf = outboundBuffer();
-        // isWritable() is currently assuming if there is no outboundBuffer then the channel is not writable.
-        // We should be consistent with that here.
-        return buf != null ? buf.bytesBeforeUnwritable() : 0;
-    }
+        long totalPending = totalPending();
+        if (totalPending == -1) {
+            // Already closed.
+            return Long.MAX_VALUE;
+        }
 
-    @Override
-    public final long bytesBeforeWritable() {
-        ChannelOutboundBuffer buf = outboundBuffer();
-        // isWritable() is currently assuming if there is no outboundBuffer then the channel is not writable.
-        // We should be consistent with that here.
-        return buf != null ? buf.bytesBeforeWritable() : Long.MAX_VALUE;
+        long bytes = config().getWriteBufferHighWaterMark() -
+                totalPending;
+        // If bytes is negative we know we are not writable, but if bytes is non-negative we have to check writability.
+        // Note that totalPendingSize and isWritable() use different volatile variables that are not synchronized
+        // together. totalPendingSize will be updated before isWritable().
+        if (bytes > 0) {
+            return isWritable() ? bytes : 0;
+        }
+        return 0;
     }
 
     /**
@@ -417,7 +431,24 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
         ClosedChannelException closedChannelException =
                 StacklessClosedChannelException.newInstance(AbstractChannel.class, "close(Promise)");
-        close(promise, closedChannelException, closedChannelException, false);
+        close(promise, closedChannelException, closedChannelException);
+    }
+
+    private void updateWritabilityIfNeeded(boolean notify) {
+        long totalPending = totalPending();
+        if (totalPending > config().getWriteBufferHighWaterMark()) {
+            if (WRITABLE_UPDATER.compareAndSet(this, 1, 0)) {
+                if (notify) {
+                    pipeline().fireChannelWritabilityChanged();
+                }
+            }
+        } else if (totalPending < config().getWriteBufferLowWaterMark()) {
+            if (WRITABLE_UPDATER.compareAndSet(this, 0, 1)) {
+                if (notify) {
+                    pipeline().fireChannelWritabilityChanged();
+                }
+            }
+        }
     }
 
     /**
@@ -448,13 +479,13 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         } catch (Throwable err) {
             promise.setFailure(err);
         } finally {
-            outboundBuffer.failFlushedAndClose(shutdownCause, false, shutdownCause, true);
+            outboundBuffer.failFlushedAndClose(shutdownCause, shutdownCause);
         }
         return true;
     }
 
     private void close(final Promise<Void> promise, final Throwable cause,
-                       final ClosedChannelException closeCause, final boolean notify) {
+                       final ClosedChannelException closeCause) {
         if (!promise.setUncancellable()) {
             return;
         }
@@ -484,10 +515,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 } finally {
                     // Call invokeLater so closeAndDeregister is executed in the EventLoop again!
                     invokeLater(() -> {
-                        if (outboundBuffer != null) {
-                            // Fail all the queued messages
-                            outboundBuffer.failFlushedAndClose(cause, notify, closeCause, false);
-                        }
+                        closeAndUpdateWritability(outboundBuffer, cause, closeCause);
                         fireChannelInactiveAndDeregister(wasActive);
                     });
                 }
@@ -497,16 +525,22 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 // Close the channel and fail the queued messages in all cases.
                 doClose0(promise);
             } finally {
-                if (outboundBuffer != null) {
-                    // Fail all the queued messages.
-                    outboundBuffer.failFlushedAndClose(cause, notify, closeCause, false);
-                }
+                closeAndUpdateWritability(outboundBuffer, cause, closeCause);
             }
             if (inFlush0) {
                 invokeLater(() -> fireChannelInactiveAndDeregister(wasActive));
             } else {
                 fireChannelInactiveAndDeregister(wasActive);
             }
+        }
+    }
+
+    private void closeAndUpdateWritability(
+            ChannelOutboundBuffer outboundBuffer, Throwable cause, Throwable closeCause) {
+        if (outboundBuffer != null) {
+            // Fail all the queued messages
+            outboundBuffer.failFlushedAndClose(cause, closeCause);
+            updateWritabilityIfNeeded(false);
         }
     }
 
@@ -702,6 +736,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         }
 
         outboundBuffer.addMessage(msg, size, promise);
+        updateWritabilityIfNeeded(true);
     }
 
     private void flushTransport() {
@@ -735,10 +770,11 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 // Check if we need to generate the exception at all.
                 if (!outboundBuffer.isEmpty()) {
                     if (isOpen()) {
-                        outboundBuffer.failFlushed(new NotYetConnectedException(), true);
+                        outboundBuffer.failFlushed(new NotYetConnectedException());
+                        updateWritabilityIfNeeded(true);
                     } else {
                         // Do not trigger channelWritabilityChanged because the channel is closed already.
-                        outboundBuffer.failFlushed(newClosedChannelException(initialCloseCause, "flush0()"), false);
+                        outboundBuffer.failFlushed(newClosedChannelException(initialCloseCause, "flush0()"));
                     }
                 }
             } finally {
@@ -752,6 +788,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         } catch (Throwable t) {
             handleWriteError(t);
         } finally {
+            updateWritabilityIfNeeded(true);
             inFlush0 = false;
         }
     }
@@ -767,7 +804,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
              * may still return {@code true} even if the channel should be closed as result of the exception.
              */
             initialCloseCause = t;
-            close(newPromise(), t, newClosedChannelException(t, "flush0()"), false);
+            close(newPromise(), t, newClosedChannelException(t, "flush0()"));
         } else {
             try {
                 if (shutdownOutput(newPromise(), t)) {
@@ -775,7 +812,7 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
                 }
             } catch (Throwable t2) {
                 initialCloseCause = t;
-                close(newPromise(), t2, newClosedChannelException(t, "flush0()"), false);
+                close(newPromise(), t2, newClosedChannelException(t, "flush0()"));
             }
         }
     }
@@ -1046,19 +1083,8 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
         }
 
         @Override
-        protected final void incrementPendingOutboundBytes(long size) {
-            ChannelOutboundBuffer buffer = ((AbstractChannel) channel()).outboundBuffer();
-            if (buffer != null) {
-                buffer.incrementPendingOutboundBytes(size);
-            }
-        }
-
-        @Override
-        protected final void decrementPendingOutboundBytes(long size) {
-            ChannelOutboundBuffer buffer = ((AbstractChannel) channel()).outboundBuffer();
-            if (buffer != null) {
-                buffer.decrementPendingOutboundBytes(size);
-            }
+        protected final void pendingOutboundBytesUpdated(long pendingOutboundBytes) {
+            abstractChannel().updateWritabilityIfNeeded(true);
         }
 
         @Override

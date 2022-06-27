@@ -20,6 +20,7 @@ import io.netty.buffer.ByteBufConvertible;
 import io.netty.buffer.ByteBufHolder;
 import io.netty.buffer.Unpooled;
 import io.netty5.buffer.api.Buffer;
+import io.netty5.util.concurrent.EventExecutor;
 import io.netty5.util.concurrent.FastThreadLocal;
 import io.netty5.util.concurrent.Promise;
 import io.netty5.util.internal.ObjectPool;
@@ -32,7 +33,6 @@ import io.netty5.util.internal.logging.InternalLoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 import static java.lang.Math.min;
@@ -44,9 +44,7 @@ import static java.util.Objects.requireNonNull;
  * <p>
  * All methods must be called by a transport implementation from an I/O thread, except the following ones:
  * <ul>
- * <li>{@link #size()} and {@link #isEmpty()}</li>
- * <li>{@link #isWritable()}</li>
- * <li>{@link #getUserDefinedWritability(int)} and {@link #setUserDefinedWritability(int, boolean)}</li>
+ * <li>{@link #totalPendingWriteBytes()} ()}</li>
  * </ul>
  * </p>
  */
@@ -72,7 +70,7 @@ public final class ChannelOutboundBuffer {
         }
     };
 
-    private final Channel channel;
+    private final EventExecutor executor;
 
     // Entry(flushedEntry) --> ... Entry(unflushedEntry) --> ... Entry(tailEntry)
     //
@@ -90,22 +88,31 @@ public final class ChannelOutboundBuffer {
 
     private boolean inFail;
 
+    // TODO: Does this need to be atomic / volatile?
     private static final AtomicLongFieldUpdater<ChannelOutboundBuffer> TOTAL_PENDING_SIZE_UPDATER =
             AtomicLongFieldUpdater.newUpdater(ChannelOutboundBuffer.class, "totalPendingSize");
-
     @SuppressWarnings("UnusedDeclaration")
     private volatile long totalPendingSize;
 
-    private static final AtomicIntegerFieldUpdater<ChannelOutboundBuffer> UNWRITABLE_UPDATER =
-            AtomicIntegerFieldUpdater.newUpdater(ChannelOutboundBuffer.class, "unwritable");
-
     @SuppressWarnings("UnusedDeclaration")
-    private volatile int unwritable;
+    ChannelOutboundBuffer(EventExecutor executor) {
+        this.executor = executor;
+    }
 
-    private volatile Runnable fireChannelWritabilityChangedTask;
+    private void incrementPendingOutboundBytes(long size) {
+        if (size == 0) {
+            return;
+        }
 
-    ChannelOutboundBuffer(AbstractChannel channel) {
-        this.channel = channel;
+        TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, size);
+    }
+
+    private void decrementPendingOutboundBytes(long size) {
+        if (size == 0) {
+            return;
+        }
+
+        TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, -size);
     }
 
     /**
@@ -113,6 +120,7 @@ public final class ChannelOutboundBuffer {
      * the message was written.
      */
     public void addMessage(Object msg, int size, Promise<Void> promise) {
+        assert executor.inEventLoop();
         Entry entry = Entry.newInstance(msg, size, total(msg), promise);
         if (tailEntry == null) {
             flushedEntry = null;
@@ -127,7 +135,8 @@ public final class ChannelOutboundBuffer {
 
         // increment pending bytes after adding message to the unflushed arrays.
         // See https://github.com/netty/netty/issues/1619
-        incrementPendingOutboundBytes(entry.pendingSize, false);
+        //
+        incrementPendingOutboundBytes(entry.pendingSize);
     }
 
     /**
@@ -135,6 +144,8 @@ public final class ChannelOutboundBuffer {
      * and so you will be able to handle them.
      */
     public void addFlush() {
+        assert executor.inEventLoop();
+
         // There is no need to process all entries if there was already a flush before and no new messages
         // where added in the meantime.
         //
@@ -149,52 +160,15 @@ public final class ChannelOutboundBuffer {
                 flushed ++;
                 if (!entry.promise.setUncancellable()) {
                     // Was cancelled so make sure we free up memory and notify about the freed bytes
+                    // TODO: Revisit
                     int pending = entry.cancel();
-                    decrementPendingOutboundBytes(pending, false, true);
+                    decrementPendingOutboundBytes(pending);
                 }
                 entry = entry.next;
             } while (entry != null);
 
             // All flushed so reset unflushedEntry
             unflushedEntry = null;
-        }
-    }
-
-    /**
-     * Increment the pending bytes which will be written at some point.
-     * This method is thread-safe!
-     */
-    void incrementPendingOutboundBytes(long size) {
-        incrementPendingOutboundBytes(size, true);
-    }
-
-    private void incrementPendingOutboundBytes(long size, boolean invokeLater) {
-        if (size == 0) {
-            return;
-        }
-
-        long newWriteBufferSize = TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, size);
-        if (newWriteBufferSize > channel.config().getWriteBufferHighWaterMark()) {
-            setUnwritable(invokeLater);
-        }
-    }
-
-    /**
-     * Decrement the pending bytes which will be written at some point.
-     * This method is thread-safe!
-     */
-    void decrementPendingOutboundBytes(long size) {
-        decrementPendingOutboundBytes(size, true, true);
-    }
-
-    private void decrementPendingOutboundBytes(long size, boolean invokeLater, boolean notifyWritability) {
-        if (size == 0) {
-            return;
-        }
-
-        long newWriteBufferSize = TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, -size);
-        if (notifyWritability && newWriteBufferSize < channel.config().getWriteBufferLowWaterMark()) {
-            setWritable(invokeLater);
         }
     }
 
@@ -218,6 +192,8 @@ public final class ChannelOutboundBuffer {
      * Return the current message to write or {@code null} if nothing was flushed before and so is ready to be written.
      */
     public Object current() {
+        assert executor.inEventLoop();
+
         Entry entry = flushedEntry;
         if (entry == null) {
             return null;
@@ -231,6 +207,8 @@ public final class ChannelOutboundBuffer {
      * @return {@code 0} if nothing was flushed before for the current message or there is no current message
      */
     public long currentProgress() {
+        assert executor.inEventLoop();
+
         Entry entry = flushedEntry;
         if (entry == null) {
             return 0;
@@ -242,6 +220,8 @@ public final class ChannelOutboundBuffer {
      * Notify the {@link Promise} of the current message about writing progress.
      */
     public void progress(long amount) {
+        assert executor.inEventLoop();
+
         Entry e = flushedEntry;
         assert e != null;
         e.progress += amount;
@@ -253,6 +233,8 @@ public final class ChannelOutboundBuffer {
      * messages are ready to be handled.
      */
     public boolean remove() {
+        assert executor.inEventLoop();
+
         Entry e = flushedEntry;
         if (e == null) {
             clearNioBuffers();
@@ -269,7 +251,7 @@ public final class ChannelOutboundBuffer {
             // only release message, notify and decrement if it was not canceled before.
             SilentDispose.trySilentDispose(msg, logger);
             safeSuccess(promise);
-            decrementPendingOutboundBytes(size, false, true);
+            decrementPendingOutboundBytes(size);
         }
 
         // recycle the entry
@@ -284,10 +266,8 @@ public final class ChannelOutboundBuffer {
      * {@code false} to signal that no more messages are ready to be handled.
      */
     public boolean remove(Throwable cause) {
-        return remove0(cause, true);
-    }
+        assert executor.inEventLoop();
 
-    private boolean remove0(Throwable cause, boolean notifyWritability) {
         Entry e = flushedEntry;
         if (e == null) {
             clearNioBuffers();
@@ -305,7 +285,7 @@ public final class ChannelOutboundBuffer {
             SilentDispose.trySilentDispose(msg, logger);
 
             safeFail(promise, cause);
-            decrementPendingOutboundBytes(size, false, notifyWritability);
+            decrementPendingOutboundBytes(size);
         }
 
         // recycle the entry
@@ -315,6 +295,8 @@ public final class ChannelOutboundBuffer {
     }
 
     private void removeEntry(Entry e) {
+        assert executor.inEventLoop();
+
         if (-- flushed == 0) {
             // processed everything
             flushedEntry = null;
@@ -332,6 +314,8 @@ public final class ChannelOutboundBuffer {
      * This operation assumes all messages in this buffer are either {@link ByteBuf}s or {@link Buffer}s.
      */
     public void removeBytes(long writtenBytes) {
+        assert executor.inEventLoop();
+
         Object msg = current();
         while (writtenBytes > 0 || hasZeroReadable(msg)) {
             if (msg instanceof Buffer) {
@@ -398,6 +382,8 @@ public final class ChannelOutboundBuffer {
      * </p>
      */
     public ByteBuffer[] nioBuffers() {
+        assert executor.inEventLoop();
+
         return nioBuffers(Integer.MAX_VALUE, Integer.MAX_VALUE);
     }
 
@@ -415,6 +401,8 @@ public final class ChannelOutboundBuffer {
      *                 in the return value to ensure write progress is made.
      */
     public ByteBuffer[] nioBuffers(int maxCount, long maxBytes) {
+        assert executor.inEventLoop();
+
         assert maxCount > 0;
         assert maxBytes > 0;
         long nioBufferSize = 0;
@@ -563,6 +551,8 @@ public final class ChannelOutboundBuffer {
      * was called.
      */
     public int nioBufferCount() {
+        assert executor.inEventLoop();
+
         return nioBufferCount;
     }
 
@@ -572,116 +562,17 @@ public final class ChannelOutboundBuffer {
      * was called.
      */
     public long nioBufferSize() {
+        assert executor.inEventLoop();
+
         return nioBufferSize;
-    }
-
-    /**
-     * Returns {@code true} if and only if {@linkplain #totalPendingWriteBytes() the total number of pending bytes} did
-     * not exceed the write watermark of the {@link Channel} and
-     * no {@linkplain #setUserDefinedWritability(int, boolean) user-defined writability flag} has been set to
-     * {@code false}.
-     */
-    public boolean isWritable() {
-        return unwritable == 0;
-    }
-
-    /**
-     * Returns {@code true} if and only if the user-defined writability flag at the specified index is set to
-     * {@code true}.
-     */
-    public boolean getUserDefinedWritability(int index) {
-        return (unwritable & writabilityMask(index)) == 0;
-    }
-
-    /**
-     * Sets a user-defined writability flag at the specified index.
-     */
-    public void setUserDefinedWritability(int index, boolean writable) {
-        if (writable) {
-            setUserDefinedWritability(index);
-        } else {
-            clearUserDefinedWritability(index);
-        }
-    }
-
-    private void setUserDefinedWritability(int index) {
-        final int mask = ~writabilityMask(index);
-        for (;;) {
-            final int oldValue = unwritable;
-            final int newValue = oldValue & mask;
-            if (UNWRITABLE_UPDATER.compareAndSet(this, oldValue, newValue)) {
-                if (oldValue != 0 && newValue == 0) {
-                    fireChannelWritabilityChanged(true);
-                }
-                break;
-            }
-        }
-    }
-
-    private void clearUserDefinedWritability(int index) {
-        final int mask = writabilityMask(index);
-        for (;;) {
-            final int oldValue = unwritable;
-            final int newValue = oldValue | mask;
-            if (UNWRITABLE_UPDATER.compareAndSet(this, oldValue, newValue)) {
-                if (oldValue == 0 && newValue != 0) {
-                    fireChannelWritabilityChanged(true);
-                }
-                break;
-            }
-        }
-    }
-
-    private static int writabilityMask(int index) {
-        if (index < 1 || index > 31) {
-            throw new IllegalArgumentException("index: " + index + " (expected: 1~31)");
-        }
-        return 1 << index;
-    }
-
-    private void setWritable(boolean invokeLater) {
-        for (;;) {
-            final int oldValue = unwritable;
-            final int newValue = oldValue & ~1;
-            if (UNWRITABLE_UPDATER.compareAndSet(this, oldValue, newValue)) {
-                if (oldValue != 0 && newValue == 0) {
-                    fireChannelWritabilityChanged(invokeLater);
-                }
-                break;
-            }
-        }
-    }
-
-    private void setUnwritable(boolean invokeLater) {
-        for (;;) {
-            final int oldValue = unwritable;
-            final int newValue = oldValue | 1;
-            if (UNWRITABLE_UPDATER.compareAndSet(this, oldValue, newValue)) {
-                if (oldValue == 0) {
-                    fireChannelWritabilityChanged(invokeLater);
-                }
-                break;
-            }
-        }
-    }
-
-    private void fireChannelWritabilityChanged(boolean invokeLater) {
-        final ChannelPipeline pipeline = channel.pipeline();
-        if (invokeLater) {
-            Runnable task = fireChannelWritabilityChangedTask;
-            if (task == null) {
-                fireChannelWritabilityChangedTask = task = pipeline::fireChannelWritabilityChanged;
-            }
-            channel.executor().execute(task);
-        } else {
-            pipeline.fireChannelWritabilityChanged();
-        }
     }
 
     /**
      * Returns the number of flushed messages in this {@link ChannelOutboundBuffer}.
      */
     public int size() {
+        assert executor.inEventLoop();
+
         return flushed;
     }
 
@@ -690,15 +581,21 @@ public final class ChannelOutboundBuffer {
      * otherwise.
      */
     public boolean isEmpty() {
+        assert executor.inEventLoop();
+
         return flushed == 0;
     }
 
-    void failFlushedAndClose(Throwable failCause, boolean notify, Throwable closeCause, boolean allowChannelOpen) {
-        failFlushed(failCause, notify);
-        close(closeCause, allowChannelOpen);
+    void failFlushedAndClose(Throwable failCause, Throwable closeCause) {
+        assert executor.inEventLoop();
+
+        failFlushed(failCause);
+        close(closeCause);
     }
 
-    void failFlushed(Throwable cause, boolean notify) {
+    void failFlushed(Throwable cause) {
+        assert executor.inEventLoop();
+
         // Make sure that this method does not reenter.  A listener added to the current promise can be notified by the
         // current thread in the tryFailure() call of the loop below, and the listener can trigger another fail() call
         // indirectly (usually by closing the channel.)
@@ -711,7 +608,7 @@ public final class ChannelOutboundBuffer {
         try {
             inFail = true;
             for (;;) {
-                if (!remove0(cause, notify)) {
+                if (!remove(cause)) {
                     break;
                 }
             }
@@ -720,17 +617,15 @@ public final class ChannelOutboundBuffer {
         }
     }
 
-    private void close(final Throwable cause, final boolean allowChannelOpen) {
+    private void close(final Throwable cause) {
+        assert executor.inEventLoop();
+
         if (inFail) {
-            channel.executor().execute(() -> close(cause, allowChannelOpen));
+            executor.execute(() -> close(cause));
             return;
         }
 
         inFail = true;
-
-        if (!allowChannelOpen && channel.isOpen()) {
-            throw new IllegalStateException("close() must be invoked after the channel is closed.");
-        }
 
         if (!isEmpty()) {
             throw new IllegalStateException("close() must be invoked after all flushed writes are handled.");
@@ -764,51 +659,17 @@ public final class ChannelOutboundBuffer {
         PromiseNotificationUtil.tryFailure(promise, cause, logger);
     }
 
-    @Deprecated
-    public void recycle() {
-        // NOOP
-    }
-
     public long totalPendingWriteBytes() {
         return totalPendingSize;
     }
-
-    /**
-     * Get how many bytes can be written until {@link #isWritable()} returns {@code false}.
-     * This quantity will always be non-negative. If {@link #isWritable()} is {@code false} then 0.
-     */
-    public long bytesBeforeUnwritable() {
-        long bytes = channel.config().getWriteBufferHighWaterMark() - totalPendingSize;
-        // If bytes is negative we know we are not writable, but if bytes is non-negative we have to check writability.
-        // Note that totalPendingSize and isWritable() use different volatile variables that are not synchronized
-        // together. totalPendingSize will be updated before isWritable().
-        if (bytes > 0) {
-            return isWritable() ? bytes : 0;
-        }
-        return 0;
-    }
-
-    /**
-     * Get how many bytes must be drained from the underlying buffer until {@link #isWritable()} returns {@code true}.
-     * This quantity will always be non-negative. If {@link #isWritable()} is {@code true} then 0.
-     */
-    public long bytesBeforeWritable() {
-        long bytes = totalPendingSize - channel.config().getWriteBufferLowWaterMark();
-        // If bytes is negative we know we are writable, but if bytes is non-negative we have to check writability.
-        // Note that totalPendingSize and isWritable() use different volatile variables that are not synchronized
-        // together. totalPendingSize will be updated before isWritable().
-        if (bytes > 0) {
-            return isWritable() ? 0 : bytes;
-        }
-        return 0;
-    }
-
     /**
      * Call {@link MessageProcessor#processMessage(Object)} for each flushed message
      * in this {@link ChannelOutboundBuffer} until {@link MessageProcessor#processMessage(Object)}
      * returns {@code false} or there are no more flushed messages to process.
      */
-    public void forEachFlushedMessage(MessageProcessor processor) throws Exception {
+    public <T extends Exception> void forEachFlushedMessage(MessageProcessor<T> processor) throws T {
+        assert executor.inEventLoop();
+
         requireNonNull(processor, "processor");
 
         Entry entry = flushedEntry;
@@ -830,15 +691,15 @@ public final class ChannelOutboundBuffer {
         return e != null && e != unflushedEntry;
     }
 
-    public interface MessageProcessor {
+    public interface MessageProcessor<T extends Exception> {
         /**
          * Will be called for each flushed message until it either there are no more flushed messages or this
          * method returns {@code false}.
          */
-        boolean processMessage(Object msg) throws Exception;
+        boolean processMessage(Object msg) throws T;
     }
 
-    static final class Entry {
+    private static final class Entry {
         private static final ObjectPool<Entry> RECYCLER = ObjectPool.newPool(Entry::new);
 
         private final Handle<Entry> handle;
@@ -909,7 +770,7 @@ public final class ChannelOutboundBuffer {
     /**
      * Thread-local cache of {@link ByteBuffer} array, and processing meta-data.
      */
-    static final class BufferCache {
+    private static final class BufferCache {
         ByteBuffer[] buffers;
         long dataSize;
         int bufferCount;
