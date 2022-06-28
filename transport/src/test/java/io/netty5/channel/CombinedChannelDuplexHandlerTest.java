@@ -252,17 +252,6 @@ public class CombinedChannelDuplexHandlerTest {
         assertEquals(Event.UNREGISTERED, handler.pollEvent());
     }
 
-    @Test
-    public void testNotSharable() {
-        assertThrows(IllegalStateException.class,
-            () -> new CombinedChannelDuplexHandler<ChannelHandler, ChannelHandler>() {
-                @Override
-                public boolean isSharable() {
-                    return true;
-                }
-            });
-    }
-
     private static final class InboundEventHandler implements ChannelHandler {
         private final Queue<Object> queue = new ArrayDeque<Object>();
 

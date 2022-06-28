@@ -105,7 +105,12 @@ public abstract class ByteToMessageDecoderForBuffer extends ChannelHandlerAdapte
 
     protected ByteToMessageDecoderForBuffer(Cumulator cumulator) {
         this.cumulator = requireNonNull(cumulator, "cumulator");
-        ensureNotSharable();
+    }
+
+    @Override
+    public final boolean isSharable() {
+        // Can't be sharable as we keep state.
+        return false;
     }
 
     /**

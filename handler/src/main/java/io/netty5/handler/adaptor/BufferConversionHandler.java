@@ -20,7 +20,6 @@ import io.netty5.buffer.api.Buffer;
 import io.netty5.buffer.api.adaptor.ByteBufAdaptor;
 import io.netty5.buffer.api.adaptor.ByteBufBuffer;
 import io.netty5.channel.ChannelHandler;
-import io.netty5.channel.ChannelHandler.Sharable;
 import io.netty5.channel.ChannelHandlerContext;
 import io.netty5.util.concurrent.Future;
 
@@ -35,14 +34,13 @@ import io.netty5.util.concurrent.Future;
  * It is, however, recommended that all handlers eventually be converted to use the {@link Buffer} API, as that is more
  * future-proof.
  * <p>
- * Instances of this handler are {@link Sharable} and can be added to multiple pipelines.
+ * Instances of this handler are sharable and can be added to multiple pipelines.
  * This is safe because the instances are immutable and thread-safe.
  *
  * @deprecated This handler will be moved out of Netty core and into a contrib repository, before Netty 5.0.0.Final
  * is released.
  */
 @Deprecated
-@Sharable
 public final class BufferConversionHandler implements ChannelHandler {
     private final Conversion onRead;
     private final Conversion onWrite;
@@ -109,6 +107,11 @@ public final class BufferConversionHandler implements ChannelHandler {
      */
     public static BufferConversionHandler byteBufToBuffer() {
         return LazyByteBufToBuffer.HANDLER;
+    }
+
+    @Override
+    public boolean isSharable() {
+        return true;
     }
 
     @Override

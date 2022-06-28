@@ -68,7 +68,6 @@ public abstract class ByteToMessageCodec<I> extends ChannelHandlerAdapter {
      *                              {@link ByteBuf}, which is backed by an byte array.
      */
     protected ByteToMessageCodec(boolean preferDirect) {
-        ensureNotSharable();
         outboundMsgMatcher = TypeParameterMatcher.find(this, ByteToMessageCodec.class, "I");
         encoder = new Encoder(preferDirect);
     }
@@ -82,9 +81,14 @@ public abstract class ByteToMessageCodec<I> extends ChannelHandlerAdapter {
      *                              {@link ByteBuf}, which is backed by an byte array.
      */
     protected ByteToMessageCodec(Class<? extends I> outboundMessageType, boolean preferDirect) {
-        ensureNotSharable();
         outboundMsgMatcher = TypeParameterMatcher.get(outboundMessageType);
         encoder = new Encoder(preferDirect);
+    }
+
+    @Override
+    public final boolean isSharable() {
+        // Can't be sharable as we keep state.
+        return false;
     }
 
     /**

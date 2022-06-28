@@ -163,8 +163,10 @@ public abstract class ByteToMessageDecoder extends ChannelHandlerAdapter {
     private int numReads;
     private ByteToMessageDecoderContext context;
 
-    protected ByteToMessageDecoder() {
-        ensureNotSharable();
+    @Override
+    public final boolean isSharable() {
+        // Can't be sharable as we keep state.
+        return false;
     }
 
     /**

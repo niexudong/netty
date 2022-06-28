@@ -17,27 +17,15 @@ package io.netty5.handler.codec;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import io.netty5.channel.ChannelHandler;
 import io.netty5.channel.ChannelHandlerContext;
 import io.netty5.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ByteToMessageCodecTest {
-
-    @Test
-    public void testSharable() {
-        assertThrows(IllegalStateException.class, InvalidByteToMessageCodec::new);
-    }
-
-    @Test
-    public void testSharable2() {
-        assertThrows(IllegalStateException.class, InvalidByteToMessageCodec2::new);
-    }
 
     @Test
     public void testForwardPendingData() {
@@ -70,31 +58,5 @@ public class ByteToMessageCodecTest {
         buf.release();
         assertNull(ch.readInbound());
         assertNull(ch.readOutbound());
-    }
-
-    @ChannelHandler.Sharable
-    private static final class InvalidByteToMessageCodec extends ByteToMessageCodec<Integer> {
-        InvalidByteToMessageCodec() {
-            super(true);
-        }
-
-        @Override
-        protected void encode(ChannelHandlerContext ctx, Integer msg, ByteBuf out) throws Exception { }
-
-        @Override
-        protected void decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception { }
-    }
-
-    @ChannelHandler.Sharable
-    private static final class InvalidByteToMessageCodec2 extends ByteToMessageCodec<Integer> {
-        InvalidByteToMessageCodec2() {
-            super(Integer.class, true);
-        }
-
-        @Override
-        protected void encode(ChannelHandlerContext ctx, Integer msg, ByteBuf out) throws Exception { }
-
-        @Override
-        protected void decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception { }
     }
 }
