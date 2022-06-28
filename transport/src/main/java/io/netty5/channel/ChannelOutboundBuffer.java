@@ -160,7 +160,6 @@ public final class ChannelOutboundBuffer {
                 flushed ++;
                 if (!entry.promise.setUncancellable()) {
                     // Was cancelled so make sure we free up memory and notify about the freed bytes
-                    // TODO: Revisit
                     int pending = entry.cancel();
                     decrementPendingOutboundBytes(pending);
                 }
