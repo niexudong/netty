@@ -362,6 +362,7 @@ public class CombinedChannelDuplexHandler<I extends ChannelHandler, O extends Ch
             return outboundCtx.sendOutboundEvent(event);
         }
     }
+
     @Override
     public long pendingOutboundBytes(ChannelHandlerContext ctx) {
         if (!outboundCtx.removed) {

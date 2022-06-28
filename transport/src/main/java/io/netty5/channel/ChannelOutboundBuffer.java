@@ -33,7 +33,6 @@ import io.netty5.util.internal.logging.InternalLoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 import static java.lang.Math.min;
 import static java.util.Objects.requireNonNull;
@@ -88,10 +87,7 @@ public final class ChannelOutboundBuffer {
 
     private boolean inFail;
 
-    // TODO: Does this need to be atomic / volatile?
-    private static final AtomicLongFieldUpdater<ChannelOutboundBuffer> TOTAL_PENDING_SIZE_UPDATER =
-            AtomicLongFieldUpdater.newUpdater(ChannelOutboundBuffer.class, "totalPendingSize");
-    @SuppressWarnings("UnusedDeclaration")
+    // We use a volatile only as its single-writer, multiple reader
     private volatile long totalPendingSize;
 
     @SuppressWarnings("UnusedDeclaration")
@@ -104,7 +100,8 @@ public final class ChannelOutboundBuffer {
             return;
         }
 
-        TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, size);
+        // Single-writer only so no atomic operation needed.
+        totalPendingSize += size;
     }
 
     private void decrementPendingOutboundBytes(long size) {
@@ -112,7 +109,8 @@ public final class ChannelOutboundBuffer {
             return;
         }
 
-        TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, -size);
+        // Single-writer only so no atomic operation needed.
+        totalPendingSize -= size;
     }
 
     /**
@@ -634,9 +632,9 @@ public final class ChannelOutboundBuffer {
         try {
             Entry e = unflushedEntry;
             while (e != null) {
-                // Just decrease; do not trigger any events via decrementPendingOutboundBytes()
                 int size = e.pendingSize;
-                TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, -size);
+
+                decrementPendingOutboundBytes(size);
 
                 if (!e.cancelled) {
                     SilentDispose.dispose(e.msg, logger);
